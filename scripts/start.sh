@@ -5,6 +5,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 N="${1:-2}"
+# macOS allows only 256 open files per process by default; the router needs more.
+ulimit -n 8192 2>/dev/null || ulimit -n 4096 2>/dev/null || true
+
+# Refuse to start if old servers still hold the ports (run ./scripts/stop.sh first).
+for port in 8000 8002 $(seq 8011 $((8010 + N))); do
+  if lsof -ti tcp:"$port" >/dev/null 2>&1; then
+    echo "port $port is already in use - stop old servers first:"
+    echo "  ./scripts/stop.sh   (or: kill \$(lsof -ti tcp:$port))"
+    exit 1
+  fi
+done
 mkdir -p logs
 : > logs/pids
 
