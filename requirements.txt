@@ -1,0 +1,5 @@
+starlette>=0.37
+uvicorn>=0.29
+requests>=2.31
+pandas>=2.0
+matplotlib>=3.8
