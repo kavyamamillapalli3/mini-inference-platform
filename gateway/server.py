@@ -113,7 +113,8 @@ async def chat_completions(request: Request):
     if body.get("stream"):
         body["stream_options"] = {"include_usage": True}   # so we can meter actual tokens
     try:
-        up = await upstream.post(f"{UPSTREAM}/v1/chat/completions", json.dumps(body).encode())
+        up = await upstream.post(f"{UPSTREAM}/v1/chat/completions", json.dumps(body).encode(),
+                                 headers={"X-Tier": tenant.tier, "X-Tenant": tenant.name})
     except (OSError, TimeoutError) as e:
         finish()
         return error(503, "unavailable", f"no replica reachable: {e}")
@@ -122,7 +123,7 @@ async def chat_completions(request: Request):
         await up.read()
         up.close()
         finish()
-        if up.status == 503:
+        if up.status in (503, 529):
             tenant.stats["upstream_overloaded"] += 1
             return error(529, "overloaded_error", "replicas are overloaded", retry_after=1)
         return error(502, "upstream_error", f"replica returned {up.status}")

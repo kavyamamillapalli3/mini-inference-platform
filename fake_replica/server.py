@@ -26,6 +26,7 @@ import json
 import os
 import time
 import uuid
+from collections import OrderedDict
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -44,6 +45,36 @@ PER_SEQ_MS = _env("PER_SEQ_MS", 0.25)             # extra per running request
 PREFILL_MS_PER_1K = _env("PREFILL_MS_PER_1K", 40.0)
 KV_CAPACITY_TOKENS = _env("KV_CAPACITY_TOKENS", 200_000, int)
 MAX_WAITING = _env("MAX_WAITING", 256, int)       # queue limit before 503
+PREFIX_CACHE_ENTRIES = _env("PREFIX_CACHE_ENTRIES", 8, int)  # system prompts kept "in KV"
+
+
+class PrefixCache:
+    """LRU of system-prompt hashes. A hit means that part of the prompt is
+    already in KV memory, so it costs no prefill (like vLLM prefix caching)."""
+
+    def __init__(self, size: int):
+        self.size = size
+        self.entries: "OrderedDict[int, int]" = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    def lookup_and_insert(self, text: str) -> int:
+        """Returns how many prompt tokens are already cached."""
+        if not text or self.size <= 0:
+            return 0
+        key = hash(text)
+        if key in self.entries:
+            self.entries.move_to_end(key)
+            self.hits += 1
+            return self.entries[key]
+        self.misses += 1
+        self.entries[key] = count_tokens(text)
+        while len(self.entries) > self.size:
+            self.entries.popitem(last=False)
+        return 0
+
+
+prefix_cache = PrefixCache(PREFIX_CACHE_ENTRIES)
 
 
 def count_tokens(text: str) -> int:
@@ -52,9 +83,10 @@ def count_tokens(text: str) -> int:
 
 
 class Seq:
-    def __init__(self, prompt_tokens: int, max_tokens: int):
+    def __init__(self, prompt_tokens: int, max_tokens: int, cached_tokens: int = 0):
         self.id = uuid.uuid4().hex[:12]
         self.prompt_tokens = prompt_tokens
+        self.prefill_tokens = max(0, prompt_tokens - cached_tokens)
         self.max_tokens = max_tokens
         self.generated = 0
         self.prefilled = False
@@ -96,7 +128,7 @@ class Engine:
             if fits:
                 self.running.append(seq)
                 self.kv_used += seq.kv_reserved
-                new_prefill += seq.prompt_tokens
+                new_prefill += seq.prefill_tokens
             else:
                 still_waiting.append(seq)
         self.waiting = still_waiting
@@ -158,7 +190,10 @@ async def chat_completions(request: Request):
     stream = bool(body.get("stream", False))
     include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
 
-    seq = Seq(prompt_tokens, max_tokens)
+    system_text = "\n".join(str(m.get("content", "")) for m in body.get("messages", [])
+                            if m.get("role") == "system")
+    cached = prefix_cache.lookup_and_insert(system_text)
+    seq = Seq(prompt_tokens, max_tokens, cached_tokens=cached)
     if not engine.submit(seq):
         return JSONResponse(
             {"error": {"type": "overloaded", "message": "replica is full, retry later"}},
@@ -231,6 +266,8 @@ async def metrics(_):
         f"fake_requests_completed_total {s['completed']}",
         f"fake_requests_cancelled_total {s['cancelled']}",
         f"fake_requests_rejected_total {s['rejected']}",
+        f"fake_prefix_cache_hits_total {prefix_cache.hits}",
+        f"fake_prefix_cache_misses_total {prefix_cache.misses}",
     ]
     return PlainTextResponse("\n".join(lines) + "\n")
 

@@ -66,13 +66,40 @@ streaming. A replica 503 becomes a 529 "overloaded" for the client. Tenants live
 without the gateway; with it, Paid's TTFT dropped to ~0.32 s (~12x) and Paid
 completed 4x more requests. Details: `results/noisy_neighbour.md`.
 
+## Router (Phase 3b): where and when a request runs
+
+```bash
+./scripts/start.sh 4          # 4 fake replicas (8011-8014) + router (8002) + gateway (8000)
+python bench/router_tests.py tiers       # Paid vs Free under overload
+python bench/router_tests.py affinity    # cache-aware vs least-loaded routing
+python bench/router_tests.py failure     # then kill a replica: kill $(lsof -ti tcp:8012)
+curl -s localhost:8002/metrics
+./scripts/stop.sh
+# compare settings by restarting with env vars, e.g.
+POLICY=fifo ./scripts/start.sh 2
+ROUTING=least_loaded ./scripts/start.sh 4
+```
+
+The router keeps bounded in-memory queues per tier with deadlines, dispatches with
+weighted round robin (4 Paid : 1 Free) and **reserves capacity** (Free uses at most 60%
+of slots). It picks a healthy replica with a free slot, preferring the one that already
+caches the request's system prompt (rendezvous hashing), else the least loaded.
+Health checks eject dead replicas; a replica failing before any token is retried once
+elsewhere, one failing mid-stream yields an explicit error event.
+
+**Results** (`results/router_results.md`):
+- Priority + reserved capacity: Paid went from 73 rejections to **0** and ~1.9x throughput vs FIFO.
+- Cache-aware routing: prefix hit rate **21% -> 83%**, median TTFT **627 ms -> 48 ms**.
+- Killing a replica: 12 in-flight streams got clean errors, the rest moved to the survivor, 0 rejections.
+
 ## Roadmap
 
 - [x] **Phase 0 - Setup:** fake replica, benchmark, plots
 - [ ] **Phase 1 - Prefill, decode, batching on a real GPU** (vLLM): batch knee, prompt length vs TTFT, roofline check
 - [ ] **Phase 2 - KV cache:** prefix caching on/off, multi-turn TTFT, preemption under memory pressure
 - [x] **Phase 3a - Gateway:** API keys, token bucket per tenant, concurrency limits, size caps, 429/529, streaming proxy
-- [ ] **Phase 3b - Router:** several replicas, tier queues with deadlines, least-loaded + cache-aware routing, cancel on disconnect, replica failure
+- [x] **Phase 3b - Router:** tier queues with deadlines, weighted priority + reserved capacity, cache-aware routing, health checks, mid-stream failure handling
+- [ ] **Phase 3c - Chunked prefill in the fake replica:** fix the ~1 s TTFT from prefill bursts
 - [ ] **Phase 4 - Async + batch API:** 202 + polling, durable queue, pull-based dispatcher, idempotent results
 - [ ] **Phase 5 - Observability:** Prometheus/Grafana, latency per layer, p95 debugging experiments
 - [ ] **Phase 6 - Autoscaling + cold start:** Kubernetes, concurrency target, warm pool, canary
@@ -87,6 +114,9 @@ gateway/upstream.py      tiny streaming HTTP client (closing it cancels generati
 gateway/tenants.json     API keys -> tenant, tier and limits
 bench/bench.py           concurrency sweep: TTFT, time per token, throughput
 bench/tenants.py         noisy-neighbour test: Free flood vs Paid, direct or via gateway
+router/server.py         tier queues, deadlines, reserved capacity, cache-aware routing, health checks
+bench/router_tests.py    router experiments: tiers, affinity, failure
+scripts/start.sh, stop.sh  start/stop N replicas + router + gateway
 bench/plot.py            charts: throughput vs per-user speed, TTFT
 docs/gpu_setup.md        renting a GPU and running vLLM against the same benchmark
 results/                 CSVs and PNGs from your runs

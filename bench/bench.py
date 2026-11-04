@@ -30,10 +30,14 @@ def make_prompt(n_tokens: int) -> str:
     return ("word " * n_tokens).strip()
 
 
-def one_request(url, model, prompt, output_tokens, api_key, timeout):
+def one_request(url, model, prompt, output_tokens, api_key, timeout,
+                system=None, extra_headers=None):
+    messages = [{"role": "user", "content": prompt}]
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": output_tokens,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -43,6 +47,7 @@ def one_request(url, model, prompt, output_tokens, api_key, timeout):
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    headers.update(extra_headers or {})
 
     t0 = time.perf_counter()
     first = last = None
@@ -67,6 +72,10 @@ def one_request(url, model, prompt, output_tokens, api_key, timeout):
                     if data == b"[DONE]":
                         continue
                     msg = json.loads(data)
+                    if msg.get("error"):
+                        # e.g. replica died mid-stream: an explicit failure
+                        return {"ok": False, "status": "midstream_error",
+                                "e2e": time.perf_counter() - t0}
                     if msg.get("usage"):
                         usage_tokens = msg["usage"].get("completion_tokens")
                     for ch in msg.get("choices", []):

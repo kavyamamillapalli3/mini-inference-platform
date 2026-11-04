@@ -7,6 +7,8 @@ the body through chunk by chunk. Closing the connection early tells the
 replica the client is gone (so it can cancel generation and free KV memory).
 """
 
+from __future__ import annotations
+
 import asyncio
 from urllib.parse import urlparse
 
@@ -24,7 +26,9 @@ class UpstreamResponse:
             while True:
                 size_line = await r.readline()
                 if not size_line:
-                    return
+                    # Connection closed before the final 0-size chunk: the
+                    # other side died mid-response. Surface it as an error.
+                    raise asyncio.IncompleteReadError(b"", None)
                 size = int(size_line.strip().split(b";")[0], 16)
                 if size == 0:
                     await r.readline()  # trailing CRLF
@@ -53,14 +57,17 @@ class UpstreamResponse:
             pass
 
 
-async def post(url: str, body: bytes, timeout: float = 10.0) -> UpstreamResponse:
+async def request(method: str, url: str, body: bytes = b"", headers: dict | None = None,
+                  timeout: float = 10.0) -> UpstreamResponse:
     u = urlparse(url)
     host, port = u.hostname, u.port or 80
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
-    head = (f"POST {u.path or '/'} HTTP/1.1\r\n"
+    extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
+    head = (f"{method} {u.path or '/'} HTTP/1.1\r\n"
             f"Host: {host}:{port}\r\n"
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(body)}\r\n"
+            f"{extra}"
             "Connection: close\r\n\r\n").encode()
     writer.write(head + body)
     await writer.drain()
@@ -75,3 +82,12 @@ async def post(url: str, body: bytes, timeout: float = 10.0) -> UpstreamResponse
         k, _, v = line.decode().partition(":")
         headers[k.strip().lower()] = v.strip()
     return UpstreamResponse(status, headers, reader, writer)
+
+
+async def post(url: str, body: bytes, headers: dict | None = None,
+               timeout: float = 10.0) -> UpstreamResponse:
+    return await request("POST", url, body, headers, timeout)
+
+
+async def get(url: str, timeout: float = 2.0) -> UpstreamResponse:
+    return await request("GET", url, b"", None, timeout)
