@@ -1,0 +1,18 @@
+{
+  "key-free-1": {
+    "tenant": "acme-free",
+    "tier": "free",
+    "tokens_per_min": 20000,
+    "max_concurrency": 4,
+    "max_prompt_tokens": 4000,
+    "max_output_tokens": 512
+  },
+  "key-paid-1": {
+    "tenant": "globex-paid",
+    "tier": "paid",
+    "tokens_per_min": 400000,
+    "max_concurrency": 32,
+    "max_prompt_tokens": 32000,
+    "max_output_tokens": 4096
+  }
+}

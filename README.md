@@ -43,12 +43,36 @@ It also serves `/metrics` (running, waiting, KV used, rejected, cancelled).
 - **Past the batch limit (64), extra requests just queue:** throughput is flat and TTFT explodes.
   That is exactly why admission control and load shedding exist.
 
+## Gateway (Phase 3a): per-tenant admission control
+
+```bash
+# terminal 1: replica
+python -m uvicorn fake_replica.server:app --port 8001 --log-level warning
+# terminal 2: gateway in front of it
+UPSTREAM=http://localhost:8001 python -m uvicorn gateway.server:app --port 8000 --log-level warning
+# terminal 3: noisy-neighbour test, without and with the gateway
+python bench/tenants.py --url http://localhost:8001 --direct --duration 20
+python bench/tenants.py --url http://localhost:8000 --duration 20
+curl -s localhost:8000/metrics
+```
+
+The gateway checks, in order: API key (401) -> size caps per tier (400) ->
+concurrency limit (429) -> token bucket in tokens/min, charging prompt + max_tokens
+up front and refunding unused tokens at the end (429 + Retry-After) -> proxy with
+streaming. A replica 503 becomes a 529 "overloaded" for the client. Tenants live in
+`gateway/tenants.json`.
+
+**Result:** a Free tenant flooding with 96 workers pushed Paid's TTFT to ~4 s
+without the gateway; with it, Paid's TTFT dropped to ~0.32 s (~12x) and Paid
+completed 4x more requests. Details: `results/noisy_neighbour.md`.
+
 ## Roadmap
 
 - [x] **Phase 0 - Setup:** fake replica, benchmark, plots
 - [ ] **Phase 1 - Prefill, decode, batching on a real GPU** (vLLM): batch knee, prompt length vs TTFT, roofline check
 - [ ] **Phase 2 - KV cache:** prefix caching on/off, multi-turn TTFT, preemption under memory pressure
-- [ ] **Phase 3 - Gateway + router:** token-bucket limits per tenant, tier queues with deadlines, 429/529 shedding, cache-aware routing, cancel on disconnect
+- [x] **Phase 3a - Gateway:** API keys, token bucket per tenant, concurrency limits, size caps, 429/529, streaming proxy
+- [ ] **Phase 3b - Router:** several replicas, tier queues with deadlines, least-loaded + cache-aware routing, cancel on disconnect, replica failure
 - [ ] **Phase 4 - Async + batch API:** 202 + polling, durable queue, pull-based dispatcher, idempotent results
 - [ ] **Phase 5 - Observability:** Prometheus/Grafana, latency per layer, p95 debugging experiments
 - [ ] **Phase 6 - Autoscaling + cold start:** Kubernetes, concurrency target, warm pool, canary
@@ -57,7 +81,12 @@ It also serves `/metrics` (running, waiting, KV used, rejected, cancelled).
 
 ```
 fake_replica/server.py   OpenAI-compatible fake GPU replica (continuous batching model)
+gateway/server.py        front door: auth, tier caps, concurrency + token-bucket limits, streaming proxy
+gateway/limits.py        token bucket and tenant state
+gateway/upstream.py      tiny streaming HTTP client (closing it cancels generation upstream)
+gateway/tenants.json     API keys -> tenant, tier and limits
 bench/bench.py           concurrency sweep: TTFT, time per token, throughput
+bench/tenants.py         noisy-neighbour test: Free flood vs Paid, direct or via gateway
 bench/plot.py            charts: throughput vs per-user speed, TTFT
 docs/gpu_setup.md        renting a GPU and running vLLM against the same benchmark
 results/                 CSVs and PNGs from your runs
